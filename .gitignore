@@ -1,3 +1,6 @@
 .vscode
 
 mongoose.c.manifest
+
+# Ignore files without a .
+[^\.]*
