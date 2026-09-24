@@ -2261,6 +2261,23 @@ static uint8_t *build_txt_record(uint8_t *p, struct mg_dnssd_record *r) {
 
 // RFC-6762 16: case-insensitivity --> RFC-1034, 1035
 
+// A wildcard-bound UDP socket's c->loc is refreshed by every mg_send(), so
+// it is never a stable stand-in for the mDNS multicast destination (it used
+// to be, back when mg_mdns_listen() bound directly to 224.0.0.251:5353).
+// Build the real destination explicitly instead, and route it through
+// mg_multicast_restore() so the link-layer address is mapped too when the
+// built-in TCP/IP stack (MG_ENABLE_TCPIP) is in use; without that,
+// connstate::mac would keep whatever unicast MAC the last receive left
+// behind, and the frame would miss the multicast group entirely.
+static void mdns_multicast_destination(struct mg_connection *c) {
+  struct mg_addr to;
+  memset(&to, 0, sizeof(to));
+  to.is_ip6 = false;
+  to.addr.ip4 = MG_IPV4(224, 0, 0, 251);
+  to.port = mg_htons(5353);
+  mg_multicast_restore(c, (uint8_t *) &to);
+}
+
 static void handle_mdns_query(struct mg_connection *c) {
   struct mg_dns_header *qh = (struct mg_dns_header *) c->recv.buf;
   struct mg_dns_rr rr;
@@ -2400,7 +2417,7 @@ static void handle_mdns_query(struct mg_connection *c) {
       p = build_name(respname, p);
       p = build_a_record(c, p, req.addr);
     }
-    if (!req.is_unicast) mg_multicast_restore(c, (uint8_t *) &c->loc);
+    if (!req.is_unicast) mdns_multicast_destination(c);
     mg_send(c, buf, (size_t) (p - buf));  // And send it!
     MG_DEBUG(("%M > %M", mg_print_ip_port, &c->loc, mg_print_ip_port, &c->rem));
     MG_DEBUG(("mDNS %s response sent", req.is_unicast ? "unicast" : "mcast"));
@@ -2611,8 +2628,14 @@ static void mdns_cb(struct mg_connection *c, int ev, void *ev_data) {
 void mg_multicast_add(struct mg_connection *c, char *ip);
 struct mg_connection *mg_mdns_listen(struct mg_mgr *mgr, mg_event_handler_t fn,
                                      void *fn_data) {
-  struct mg_connection *c =
-      mg_listen(mgr, "udp://224.0.0.251:5353", fn, fn_data);
+  struct mg_connection *c;
+  if (mgr->mdns != NULL) return NULL;  // One listener owns the responder+resolver
+  // Bind the wildcard address, not the multicast group: some responders
+  // send QU (unicast-requested) replies straight to our own IP rather than
+  // to the multicast group, and a socket bound to 224.0.0.251 only would
+  // never see those. mdns_multicast_destination() (above) is what still
+  // sends our own queries/replies to the multicast group from here.
+  c = mg_listen(mgr, "udp://0.0.0.0:5353", fn, fn_data);
   if (c == NULL) return NULL;
   c->mgr->mdns = c;  // Add mDNS entry to enable resolver to use it
   c->pfn = mdns_cb, c->pfn_data = fn_data;
@@ -2622,7 +2645,7 @@ struct mg_connection *mg_mdns_listen(struct mg_mgr *mgr, mg_event_handler_t fn,
 
 static bool mdns_query(struct mg_connection *c, struct mg_str *name,
                        unsigned int rtype) {
-  mg_multicast_restore(c, (uint8_t *) &c->loc);
+  mdns_multicast_destination(c);
   return dns_send(c, name, rtype, 0, 0);  // RFC-6762 18.1 id = 0, 18.6 RD = 0
 }
 
@@ -14871,10 +14894,12 @@ void mg_multicast_add(struct mg_connection *c, char *ip) {
   MG_ERROR(("struct ip_mreq not defined"));
 #else
   struct ip_mreq mreq;
+  int ttl = 255;  // RFC 6762 11: mDNS packets must be sent with TTL 255
   mreq.imr_multiaddr.s_addr = inet_addr(ip);
   mreq.imr_interface.s_addr = mg_htonl(INADDR_ANY);
   setsockopt(FD(c), IPPROTO_IP, IP_ADD_MEMBERSHIP, (char *) &mreq,
              sizeof(mreq));
+  setsockopt(FD(c), IPPROTO_IP, IP_MULTICAST_TTL, (char *) &ttl, sizeof(ttl));
 #endif  // !Zephyr
 #endif  // !lwIP
 #endif
@@ -14914,6 +14939,18 @@ bool mg_open_listener(struct mg_connection *c, const char *url) {
       // SO_REUSE = 1 in lwipopts.h, otherwise the code below will compile but
       // won't work! (setsockopt will return EINVAL)
       MG_ERROR(("setsockopt(SO_REUSEADDR): %d", MG_SOCK_ERR(rc)));
+#endif
+#if defined(SO_REUSEPORT)
+      // UDP only: lets several sockets share the exact same address:port,
+      // e.g. our mDNS listener and the platform's own mDNS responder (such
+      // as macOS's mDNSResponder/Bonjour, which otherwise refuses our bind
+      // to the wildcard address on port 5353 outright). Not applied to TCP,
+      // where silently sharing a listening port across processes would be
+      // a surprising, security-relevant behaviour change.
+    } else if (type == SOCK_DGRAM &&
+               (rc = setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (char *) &on,
+                                sizeof(on))) != 0) {
+      MG_ERROR(("setsockopt(SO_REUSEPORT): %d", MG_SOCK_ERR(rc)));
 #endif
 #if MG_IPV6_V6ONLY
       // Bind only to the V6 address, not V4 address on this port
