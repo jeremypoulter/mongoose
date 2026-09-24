@@ -602,6 +602,14 @@ static void handle_mdns_response(struct mg_connection *c) {
   // RFC-6762 Appendix C, RFC2181 11: m(n + 1-63), max 255 + 0x0
   char name[256], srvcproto[256], instance[256], host[256];
   uint16_t atype = 0;
+  // RFC-6762 6: a (legacy) responder may echo the question(s) back ahead of
+  // the answers. Skip over them so the Answer Section loop below starts at
+  // the right offset instead of misreading a question as a resource record.
+  for (i = 0; i < mg_ntohs(rh->num_questions); i++) {
+    if ((n = mg_dns_parse_rr(c->recv.buf, c->recv.len, roff, true, &rr)) == 0)
+      return;
+    roff += n;
+  }
   answers = mg_ntohs(rh->num_answers);
   num = answers + mg_ntohs(rh->num_other_prs);
   if (answers == 0) return;
