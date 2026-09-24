@@ -45,6 +45,11 @@ struct mg_mgr {
   uint16_t mqtt_id;             // Packet ID counter for MQTT pub/sub
   void *active_dns_requests;    // Pending DNS queries (internal)
   void *active_mdns_requests;   // Pending mDNS resolver queries (internal)
+  struct {
+    char name[64];
+    struct mg_addr addr;
+    uint64_t expires;
+  } mdns_cache[MG_MDNS_CACHE_SIZE];  // Recently resolved .local addresses
   struct mg_timer *timers;      // Linked list of active timers
   int epoll_fd;                 // epoll file descriptor; -1 when unused (MG_EPOLL_ENABLE=1)
   struct mg_tcpip_if *ifp;      // Builtin TCP/IP stack: network interface pointer
