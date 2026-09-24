@@ -2835,8 +2835,9 @@ static void test_dns(void) {
     // keeps rejecting them.
     struct mg_dns_rr rr;
     uint8_t d[600];
+    uint8_t rrbytes[9] = {3, 'f', 'o', 'o', 0, 0, 1, 0, 1};
     memset(d, 0, sizeof(d));
-    memcpy(d + 12, (uint8_t[]) {3, 'f', 'o', 'o', 0, 0, 1, 0, 1}, 9);
+    memcpy(d + 12, rrbytes, sizeof(rrbytes));
     ASSERT(mg_dns_parse_rr(d, sizeof(d), 12, true, &rr) != 0);
     memset(&dm, 0, sizeof(dm));
     ASSERT(mg_dns_parse(d, sizeof(d), &dm) == 0);
