@@ -2808,6 +2808,27 @@ static void test_dns(void) {
     ASSERT(strcmp(dm.name, "abc.local") == 0);
   }
 
+  {
+    // .local must be matched case-insensitively (RFC 6762 16) and a
+    // trailing root dot must be tolerated; both must route to the mDNS
+    // resolver rather than falling through to ordinary unicast DNS, shown
+    // here by the distinct "no mDNS listener" error each produces.
+    const char *mdns_urls[] = {"http://foo.LOCAL", "http://foo.local."};
+    size_t k;
+    for (k = 0; k < sizeof(mdns_urls) / sizeof(mdns_urls[0]); k++) {
+      struct mg_mgr mgr2;
+      char *buf2 = NULL;
+      int i;
+      mg_mgr_init(&mgr2);
+      mg_http_connect(&mgr2, mdns_urls[k], fn1, &buf2);
+      for (i = 0; i < 50 && buf2 == NULL; i++) mg_mgr_poll(&mgr2, 1);
+      ASSERT(buf2 != NULL &&
+             strcmp(buf2, "no mDNS listener, see mg_mdns_listen()") == 0);
+      mg_free(buf2);
+      mg_mgr_free(&mgr2);
+    }
+  }
+
   test_dns_error("udp://127.0.0.1:12345", "DNS timeout");
   test_dns_error("", "resolver");
   test_dns_error("tcp://0.0.0.0:0", "DNS error");
