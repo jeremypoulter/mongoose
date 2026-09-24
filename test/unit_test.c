@@ -2808,6 +2808,40 @@ static void test_dns(void) {
     ASSERT(strcmp(dm.name, "abc.local") == 0);
   }
 
+  {
+    // Label length byte with a reserved bit pattern (0x40, top bits 01) must
+    // be rejected outright, not misread as a compression pointer (which
+    // requires both top bits set, 0xc0).
+    struct mg_dns_rr rr;
+    uint8_t d[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 12-byte header
+                   0x41, 0, 0, 1, 0, 1};                // bogus label, type, class
+    ASSERT(mg_dns_parse_rr(d, sizeof(d), 12, true, &rr) == 0);
+  }
+
+  {
+    // A label that runs off the end of the buffer without a terminating
+    // root label (0x00) must be rejected, not silently accepted as if the
+    // name ended early.
+    struct mg_dns_rr rr;
+    uint8_t d[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 12-byte header
+                   3, 'f', 'o', 'o'};                   // "foo", no root label
+    ASSERT(mg_dns_parse_rr(d, sizeof(d), 12, true, &rr) == 0);
+  }
+
+  {
+    // mg_dns_parse_rr() must be usable on datagrams over the classic
+    // 512-byte DNS-over-UDP limit (mDNS/DNS-SD routinely exceed it), while
+    // mg_dns_parse() -- the ordinary unicast DNS client's entry point --
+    // keeps rejecting them.
+    struct mg_dns_rr rr;
+    uint8_t d[600];
+    memset(d, 0, sizeof(d));
+    memcpy(d + 12, (uint8_t[]) {3, 'f', 'o', 'o', 0, 0, 1, 0, 1}, 9);
+    ASSERT(mg_dns_parse_rr(d, sizeof(d), 12, true, &rr) != 0);
+    memset(&dm, 0, sizeof(dm));
+    ASSERT(mg_dns_parse(d, sizeof(d), &dm) == 0);
+  }
+
   test_dns_error("udp://127.0.0.1:12345", "DNS timeout");
   test_dns_error("", "resolver");
   test_dns_error("tcp://0.0.0.0:0", "DNS error");
