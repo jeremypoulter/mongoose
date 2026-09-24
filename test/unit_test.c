@@ -3643,6 +3643,54 @@ static void test_udp(void) {
   ASSERT(mgr.conns == NULL);
 }
 
+static int s_mdns_resp_seen;
+
+static void mdns_resp_fn(struct mg_connection *c, int ev, void *ev_data) {
+  if (ev == MG_EV_MDNS_RESP) {
+    struct mg_mdns_resp *resp = (struct mg_mdns_resp *) ev_data;
+    if (resp->rr->atype == MG_DNS_RTYPE_A &&
+        mg_strcmp(resp->name, mg_str("echo-test.local")) == 0) {
+      s_mdns_resp_seen++;
+    }
+  }
+  (void) c;
+}
+
+static void raw_fn(struct mg_connection *c, int ev, void *ev_data) {
+  (void) c, (void) ev, (void) ev_data;
+}
+
+// RFC-6762 6: a (legacy) responder may echo the question(s) back ahead of
+// the answers in its reply. handle_mdns_response() must skip them, not
+// misparse the first one as a resource record.
+static void test_mdns_response_skips_question(void) {
+  struct mg_mgr mgr;
+  struct mg_connection *listener, *sender;
+  int i;
+  // clang-format off
+  uint8_t pkt[] = {
+      0, 0, 0x84, 0, 0, 1, 0, 1, 0, 0, 0, 0,  // header: 1 question, 1 answer
+      // Question: echo-test.local A IN (echoed back by the "responder")
+      9, 'e', 'c', 'h', 'o', '-', 't', 'e', 's', 't', 5, 'l', 'o', 'c', 'a', 'l', 0,
+      0, 1, 0, 1,
+      // Answer: name = pointer to offset 12 (the question's name), A IN
+      0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 120, 0, 4, 192, 0, 2, 5,
+  };
+  // clang-format on
+
+  s_mdns_resp_seen = 0;
+  mg_mgr_init(&mgr);
+  listener = mg_mdns_listen(&mgr, mdns_resp_fn, NULL);
+  ASSERT(listener != NULL);
+  sender = mg_connect(&mgr, "udp://224.0.0.251:5353", raw_fn, NULL);
+  ASSERT(sender != NULL);
+  mg_send(sender, pkt, sizeof(pkt));
+  for (i = 0; i < 200 && s_mdns_resp_seen == 0; i++) mg_mgr_poll(&mgr, 5);
+  ASSERT(s_mdns_resp_seen > 0);
+
+  mg_mgr_free(&mgr);
+}
+
 static void test_check_ip_acl(void) {
   struct mg_addr ip = {{{1, 2, 3, 4}}, 0, 0, false};  // 1.2.3.4
   ASSERT(mg_check_ip_acl(mg_str(NULL), &ip) == 1);
@@ -5717,6 +5765,10 @@ int main(void) {
   s_error = false;
   test_udp();
   DASHBOARD("udp");
+
+  s_error = false;
+  test_mdns_response_skips_question();
+  DASHBOARD("mdns_response_skips_question");
 
   s_error = false;
   test_wakeup();
