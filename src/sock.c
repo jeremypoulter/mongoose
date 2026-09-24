@@ -268,6 +268,18 @@ bool mg_open_listener(struct mg_connection *c, const char *url) {
       // won't work! (setsockopt will return EINVAL)
       MG_ERROR(("setsockopt(SO_REUSEADDR): %d", MG_SOCK_ERR(rc)));
 #endif
+#if defined(SO_REUSEPORT)
+      // UDP only: lets several sockets share the exact same address:port,
+      // e.g. our mDNS listener and the platform's own mDNS responder (such
+      // as macOS's mDNSResponder/Bonjour, which otherwise refuses our bind
+      // to the wildcard address on port 5353 outright). Not applied to TCP,
+      // where silently sharing a listening port across processes would be
+      // a surprising, security-relevant behaviour change.
+    } else if (type == SOCK_DGRAM &&
+               (rc = setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (char *) &on,
+                                sizeof(on))) != 0) {
+      MG_ERROR(("setsockopt(SO_REUSEPORT): %d", MG_SOCK_ERR(rc)));
+#endif
 #if MG_IPV6_V6ONLY
       // Bind only to the V6 address, not V4 address on this port
     } else if (c->loc.is_ip6 &&
