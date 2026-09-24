@@ -3643,6 +3643,90 @@ static void test_udp(void) {
   ASSERT(mgr.conns == NULL);
 }
 
+// mg_mdns_listen()'s connection closing must clear mgr->mdns, or a later
+// .local resolve dereferences a dangling pointer (mg_resolve() passes
+// c->mgr->mdns straight to sendmdnsreq()).
+static void test_mdns_close_clears_mgr(void) {
+  struct mg_mgr mgr;
+  char *buf = NULL;
+  int i;
+  mg_mgr_init(&mgr);
+  ASSERT(mg_mdns_listen(&mgr, fn1, NULL) != NULL);
+  ASSERT(mgr.mdns != NULL);
+  mg_close_conn(mgr.mdns);
+  ASSERT(mgr.mdns == NULL);
+  // A .local resolve after the listener is gone must fail cleanly (and,
+  // under ASan, not touch freed memory) instead of using the dangling
+  // pointer this used to leave behind.
+  mg_http_connect(&mgr, "http://still-works.local", fn1, &buf);
+  for (i = 0; i < 50 && buf == NULL; i++) mg_mgr_poll(&mgr, 1);
+  ASSERT(buf != NULL &&
+         strcmp(buf, "no mDNS listener, see mg_mdns_listen()") == 0);
+  mg_free(buf);
+  mg_mgr_free(&mgr);
+}
+
+static void mdns_teardown_responder_fn(struct mg_connection *c, int ev,
+                                       void *ev_data) {
+  if (ev == MG_EV_MDNS_REQ) {
+    struct mg_mdns_req *req = (struct mg_mdns_req *) ev_data;
+    if (req->rr->atype == MG_DNS_RTYPE_A) {
+      req->is_resp = true;
+      req->respname = req->reqname;  // echo back whatever was asked
+    }
+  }
+  (void) c;
+}
+
+static struct mg_connection *s_mdns_reentrant_other;
+
+static void mdns_reentrant_fn(struct mg_connection *c, int ev,
+                              void *ev_data) {
+  if (ev == MG_EV_CONNECT && s_mdns_reentrant_other != NULL) {
+    // Simulate an app that reacts to one resolved connection by tearing
+    // down another in-flight one, synchronously, from inside the event
+    // handler mdns_cb() calls into for the first. If mdns_cb() were still
+    // walking the pending-request list via a pointer captured before this
+    // call, closing s_mdns_reentrant_other here (which frees its
+    // mdns_data entry) would leave that walk holding a dangling pointer.
+    struct mg_connection *other = s_mdns_reentrant_other;
+    s_mdns_reentrant_other = NULL;
+    mg_close_conn(other);
+  }
+  (void) c, (void) ev_data;
+}
+
+static void test_mdns_resp_reentrant_close_safe(void) {
+  struct mg_mgr mgr;
+  struct mg_connection *a, *b;
+  int i;
+
+  mg_mgr_init(&mgr);
+  ASSERT(mg_mdns_listen(&mgr, mdns_teardown_responder_fn, NULL) != NULL);
+  // Two connections resolving the same name: mdns_cb()'s MG_EV_MDNS_RESP
+  // handler processes every matching pending request from one response,
+  // so both a and b's mdns_data entries are visited by the same call.
+  a = mg_connect(&mgr, "udp://shared.local:1", mdns_reentrant_fn, NULL);
+  b = mg_connect(&mgr, "udp://shared.local:2", mdns_reentrant_fn, NULL);
+  ASSERT(a != NULL && b != NULL);
+  s_mdns_reentrant_other = b;
+  if (!mg_mdns_query(mgr.mdns, "shared.local", MG_DNS_RTYPE_A)) {
+    // Some BSD-derived socket stacks (seen on macOS CI) refuse to send from
+    // mg_mdns_listen()'s multicast-address-bound socket -- a pre-existing
+    // platform limitation unrelated to the use-after-free fix under test
+    // (a's and b's own resolves will have hit the same thing). Skip rather
+    // than fail on a platform quirk.
+    MG_INFO(("mDNS multicast send unsupported on this platform, skipping"));
+    mg_mgr_free(&mgr);
+    return;
+  }
+  for (i = 0; i < 200 && s_mdns_reentrant_other != NULL; i++)
+    mg_mgr_poll(&mgr, 5);
+  ASSERT(s_mdns_reentrant_other == NULL);  // a's handler ran and closed b
+
+  mg_mgr_free(&mgr);  // ASan/UBSan would flag any use-after-free above
+}
+
 static void test_check_ip_acl(void) {
   struct mg_addr ip = {{{1, 2, 3, 4}}, 0, 0, false};  // 1.2.3.4
   ASSERT(mg_check_ip_acl(mg_str(NULL), &ip) == 1);
@@ -5717,6 +5801,11 @@ int main(void) {
   s_error = false;
   test_udp();
   DASHBOARD("udp");
+
+  s_error = false;
+  test_mdns_close_clears_mgr();
+  test_mdns_resp_reentrant_close_safe();
+  DASHBOARD("mdns_resolver_teardown");
 
   s_error = false;
   test_wakeup();

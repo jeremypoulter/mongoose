@@ -736,38 +736,55 @@ static void handle_mdns_record(struct mg_connection *c) {
 }
 
 static void mdns_cb(struct mg_connection *c, int ev, void *ev_data) {
-  struct mdns_data *d, *tmp;
+  struct mdns_data *d;
   struct mdns_data **head = (struct mdns_data **) &c->mgr->active_mdns_requests;
-  // mDNS resolver
+  // mDNS resolver. MG_EV_ERROR/mg_connect_resolved() below call into
+  // arbitrary user code for a *different* connection than this one (d->c),
+  // which may itself close/resolve other pending mDNS requests and so free
+  // other entries of this same list. A loop that captures d->next before
+  // that call, then keeps using it, risks walking into freed memory; scan
+  // from *head again after every such call instead of trusting a stale
+  // "next" pointer.
   if (ev == MG_EV_POLL) {
     uint64_t now = *(uint64_t *) ev_data;
-    for (d = *head; d != NULL; d = tmp) {
-      tmp = d->next;
-      // MG_DEBUG(("%lu %lu mdns poll", d->expire, now));
-      if (now > d->expire) mg_error(d->c, "mDNS timeout");  // will remove entry
+    for (;;) {
+      struct mg_connection *client;
+      for (d = *head; d != NULL && now <= d->expire; d = d->next) {
+      }
+      if (d == NULL) break;
+      client = d->c;
+      mdns_free(head, d);
+      mg_error(client, "mDNS timeout");
     }
   } else if (ev == MG_EV_CLOSE) {
-    for (d = *head; d != NULL; d = tmp) {
-      tmp = d->next;
-      mg_error(d->c, "mDNS listener error");  // this will remove entry
+    if (c->mgr->mdns == c) c->mgr->mdns = NULL;
+    while (*head != NULL) {
+      struct mg_connection *client = (*head)->c;
+      mdns_free(head, *head);
+      mg_error(client, "mDNS listener error");
     }
   } else if (ev == MG_EV_MDNS_RESP) {
     struct mg_mdns_resp *resp = (struct mg_mdns_resp *) ev_data;
     if (resp->rr->atype == MG_DNS_RTYPE_A) {
-      for (d = *head; d != NULL; d = tmp) {
-        tmp = d->next;
-        if (mg_strcasecmp(d->name, resp->name) != 0) continue;
-        if (d->c->is_resolving) {
-          resp->addr.port = d->c->rem.port;  // Save port
-          d->c->rem = resp->addr;            // Copy resolved address
-          MG_DEBUG(("%lu %.*s is %M", d->c->id, resp->name.len, resp->name.buf,
-                    mg_print_ip, &d->c->rem));
-          mg_connect_resolved(d->c);
-        } else {
-          // this should not happen, unless above does not clear c->is_resolving
-          MG_ERROR(("%lu already resolved", d->c->id));
+      for (;;) {
+        struct mg_connection *client;
+        for (d = *head; d != NULL && mg_strcasecmp(d->name, resp->name) != 0;
+             d = d->next) {
         }
+        if (d == NULL) break;
+        client = d->c;
         mdns_free(head, d);
+        if (client->is_resolving && !client->is_closing) {
+          uint16_t port = client->rem.port;
+          client->rem = resp->addr;
+          client->rem.port = port;  // Keep the port the caller asked for
+          MG_DEBUG(("%lu %.*s is %M", client->id, resp->name.len,
+                    resp->name.buf, mg_print_ip, &client->rem));
+          mg_connect_resolved(client);
+        } else {
+          // this should not happen, unless above does not clear is_resolving
+          MG_ERROR(("%lu already resolved", client->id));
+        }
       }
     }
   } else if (ev == MG_EV_READ) {
