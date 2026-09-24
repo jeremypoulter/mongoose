@@ -3643,6 +3643,48 @@ static void test_udp(void) {
   ASSERT(mgr.conns == NULL);
 }
 
+// mg_mdns_listen()'s fn_data doubles as the responder's own hostname (see
+// handle_mdns_query()'s defname), so the counters this test needs can't
+// also live in fn_data; use file-scope statics instead, like s_error above.
+static int s_mdns_req_seen;
+static int s_mdns_resp_seen;
+
+static void mdns_test_fn(struct mg_connection *c, int ev, void *ev_data) {
+  if (ev == MG_EV_MDNS_REQ) {
+    struct mg_mdns_req *req = (struct mg_mdns_req *) ev_data;
+    s_mdns_req_seen++;
+    if (req->rr->atype == MG_DNS_RTYPE_A) req->is_resp = true;
+  } else if (ev == MG_EV_MDNS_RESP) {
+    struct mg_mdns_resp *resp = (struct mg_mdns_resp *) ev_data;
+    if (resp->rr->atype == MG_DNS_RTYPE_A &&
+        mg_strcmp(resp->name, mg_str("mdns-test.local")) == 0) {
+      s_mdns_resp_seen++;
+    }
+  }
+  (void) c;
+}
+
+static void test_mdns(void) {
+  struct mg_mgr mgr;
+  struct mg_connection *c, *c2;
+  int i;
+
+  s_mdns_req_seen = s_mdns_resp_seen = 0;
+  // A single mDNS listener owns both the responder and the resolver role.
+  mg_mgr_init(&mgr);
+  c = mg_mdns_listen(&mgr, mdns_test_fn, (void *) "mdns-test");
+  ASSERT(c != NULL);
+  c2 = mg_mdns_listen(&mgr, mdns_test_fn, NULL);
+  ASSERT(c2 == NULL);  // one owner per manager
+
+  ASSERT(mg_mdns_query(c, "mdns-test.local", MG_DNS_RTYPE_A) == true);
+  for (i = 0; i < 200 && s_mdns_resp_seen == 0; i++) mg_mgr_poll(&mgr, 5);
+  ASSERT(s_mdns_req_seen > 0);
+  ASSERT(s_mdns_resp_seen > 0);
+
+  mg_mgr_free(&mgr);
+}
+
 static void test_check_ip_acl(void) {
   struct mg_addr ip = {{{1, 2, 3, 4}}, 0, 0, false};  // 1.2.3.4
   ASSERT(mg_check_ip_acl(mg_str(NULL), &ip) == 1);
@@ -5717,6 +5759,10 @@ int main(void) {
   s_error = false;
   test_udp();
   DASHBOARD("udp");
+
+  s_error = false;
+  test_mdns();
+  DASHBOARD("mdns");
 
   s_error = false;
   test_wakeup();

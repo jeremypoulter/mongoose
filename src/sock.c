@@ -222,10 +222,12 @@ void mg_multicast_add(struct mg_connection *c, char *ip) {
   MG_ERROR(("struct ip_mreq not defined"));
 #else
   struct ip_mreq mreq;
+  int ttl = 255;  // RFC 6762 11: mDNS packets must be sent with TTL 255
   mreq.imr_multiaddr.s_addr = inet_addr(ip);
   mreq.imr_interface.s_addr = mg_htonl(INADDR_ANY);
   setsockopt(FD(c), IPPROTO_IP, IP_ADD_MEMBERSHIP, (char *) &mreq,
              sizeof(mreq));
+  setsockopt(FD(c), IPPROTO_IP, IP_MULTICAST_TTL, (char *) &ttl, sizeof(ttl));
 #endif  // !Zephyr
 #endif  // !lwIP
 #endif
