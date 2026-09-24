@@ -58,24 +58,39 @@ static size_t mg_dns_parse_name_depth(const uint8_t *s, size_t len, size_t ofs,
                                       int depth) {
   size_t i = 0;
   if (tolen > 0 && depth == 0) to[0] = '\0';
-  if (depth > 5) return 0;
+  // RFC 1035 has no hard cap on pointer-chain length; 16 comfortably covers
+  // legitimate DNS-SD names (instance -> service -> local, each possibly
+  // compressed) while still bounding recursion.
+  if (depth > 16) return 0;
   // MG_INFO(("ofs %lx %x %x", (unsigned long) ofs, s[ofs], s[ofs + 1]));
-  while (ofs + i + 1 < len) {
+  while (ofs < len && i < len - ofs) {
     size_t n = s[ofs + i];
-    if (n == 0) {
-      i++;
-      break;
+    if (n == 0) {  // Root label: name ends here
+      if (to != NULL && j < tolen) to[j] = '\0';
+      return i + 1;
     }
-    if (n & 0xc0) {
-      size_t ptr = (((n & 0x3f) << 8) | s[ofs + i + 1]);  // 12 is hdr len
+    if ((n & 0xc0) == 0xc0) {  // Compression pointer, RFC 1035 4.1.4
+      size_t ptr;
+      if (i + 1 >= len - ofs) return 0;  // 2nd pointer byte missing
+      ptr = (((n & 0x3f) << 8) | s[ofs + i + 1]);  // 12 is hdr len
       // MG_INFO(("PTR %lx", (unsigned long) ptr));
-      if (ptr + 1 < len && (s[ptr] & 0xc0) == 0 &&
+      // Only follow a pointer that goes strictly backwards to a byte that
+      // isn't itself a pointer; that makes a pointer cycle structurally
+      // impossible (the depth limit above is then only a backstop) since
+      // ptr < ofs + i shrinks on every hop. A self-reference, a forward
+      // jump, or a pointer-to-pointer is left unfollowed: the name so far
+      // (possibly empty) is treated as complete, matching this parser's
+      // long-standing behaviour for that class of malformed input.
+      if (ptr < ofs + i && (s[ptr] & 0xc0) == 0 &&
           mg_dns_parse_name_depth(s, len, ptr, to, tolen, j, depth + 1) == 0)
         return 0;
-      i += 2;
-      break;
+      return i + 2;
     }
-    if (ofs + i + n + 1 >= len) return 0;
+    if (n & 0xc0) return 0;  // 0x40/0x80 prefix: reserved, not a label length
+    // RFC 1035 4.1.4: label len must not run past the buffer or exceed 63;
+    // 3.1: encoded name (label-length bytes included) is capped at 255.
+    if (n > 63 || i + n + 1 > len - ofs || j + n + (j > 0 ? 1 : 0) > 253)
+      return 0;
     if (j > 0) {
       if (j < tolen) to[j] = '.';
       j++;
@@ -86,8 +101,7 @@ static size_t mg_dns_parse_name_depth(const uint8_t *s, size_t len, size_t ofs,
     if (j < tolen) to[j] = '\0';  // Zero-terminate this chunk
     // MG_INFO(("--> [%s]", to));
   }
-  if (tolen > 0) to[tolen - 1] = '\0';  // Make sure it is nul-term
-  return i;
+  return 0;  // Ran out of buffer before the terminating root label
 }
 
 static size_t mg_dns_parse_name(const uint8_t *s, size_t n, size_t ofs,
@@ -97,11 +111,12 @@ static size_t mg_dns_parse_name(const uint8_t *s, size_t n, size_t ofs,
 
 size_t mg_dns_parse_rr(const uint8_t *buf, size_t len, size_t ofs,
                        bool is_question, struct mg_dns_rr *rr) {
-  const uint8_t *s = buf + ofs, *e = &buf[len];
+  const uint8_t *s, *e;
 
   memset(rr, 0, sizeof(*rr));
   if (len < sizeof(struct mg_dns_header)) return 0;  // Too small
-  if (len > 512) return 0;  //  Too large, we don't expect that
+  if (ofs >= len) return 0;  // Overflow: guard buf + ofs below
+  s = buf + ofs, e = &buf[len];
   if (s >= e) return 0;     //  Overflow
 
   if ((rr->nlen = (uint16_t) mg_dns_parse_name(buf, len, ofs, NULL, 0)) == 0)
@@ -127,6 +142,10 @@ bool mg_dns_parse(const uint8_t *buf, size_t len, struct mg_dns_message *dm) {
   memset(dm, 0, sizeof(*dm));
 
   if (len < sizeof(*h)) return 0;                // Too small, headers dont fit
+  // Ordinary DNS-over-UDP is historically capped at 512 bytes. mDNS/DNS-SD
+  // callers parse records with mg_dns_parse_rr() directly and are not
+  // bound by this; keep the cap here, at the DNS client's entry point.
+  if (len > 512) return 0;
   if (mg_ntohs(h->num_questions) > 1) return 0;  // Sanity
   num_answers = mg_ntohs(h->num_answers);
   if (num_answers > 10) {
