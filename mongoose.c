@@ -2133,12 +2133,17 @@ static void sendnsreq(struct mg_connection *c, struct mg_str *name, int ms,
 void mg_resolve(struct mg_connection *c, const char *url) {
   struct mg_str host = mg_url_host(url);
   c->rem.port = mg_htons(mg_url_port(url));
+  // A fully-qualified name may carry a trailing root dot (RFC 1035 3.1);
+  // strip it before matching the .local suffix or sending it out.
+  if (host.len > 0 && host.buf[host.len - 1] == '.') host.len--;
   if (mg_aton(host, &c->rem)) {
     // host is an IP address, do not fire name resolution
     mg_connect_resolved(c);
   } else if (host.len > 6 &&
-             strncmp(".local", &host.buf[host.len - 6], 6) == 0) {
-    // this is a request for a .local name (mDNS)
+             mg_strcasecmp(mg_str_n(host.buf + host.len - 6, 6),
+                           mg_str(".local")) == 0) {
+    // this is a request for a .local name (mDNS). RFC 6762 16: DNS names
+    // (and therefore this suffix) are matched case-insensitively.
     sendmdnsreq(c, &host, 500, c->mgr->mdns, c->mgr->use_dns6);  // 500ms tmout
   } else {
     // host is not an IP nor a .local, send DNS resolution request
