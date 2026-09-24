@@ -2138,8 +2138,24 @@ void mg_resolve(struct mg_connection *c, const char *url) {
     mg_connect_resolved(c);
   } else if (host.len > 6 &&
              strncmp(".local", &host.buf[host.len - 6], 6) == 0) {
-    // this is a request for a .local name (mDNS)
-    sendmdnsreq(c, &host, 500, c->mgr->mdns, c->mgr->use_dns6);  // 500ms tmout
+    // this is a request for a .local name (mDNS). Check the small
+    // recently-resolved cache first: RFC-6762 6 forbids a responder from
+    // repeating a multicast answer within 1s, so a client that resolves
+    // several .local names on the same peer back to back (e.g. one lookup
+    // per advertised service) would otherwise stall on that throttle for
+    // every lookup after the first.
+    size_t i;
+    for (i = 0; i < MG_MDNS_CACHE_SIZE; i++) {
+      if (c->mgr->mdns_cache[i].expires > mg_millis() &&
+          mg_strcasecmp(host, mg_str(c->mgr->mdns_cache[i].name)) == 0) {
+        uint16_t port = c->rem.port;
+        c->rem = c->mgr->mdns_cache[i].addr;
+        c->rem.port = port;
+        mg_connect_resolved(c);
+        return;
+      }
+    }
+    sendmdnsreq(c, &host, c->mgr->dnstimeout, c->mgr->mdns, c->mgr->use_dns6);
   } else {
     // host is not an IP nor a .local, send DNS resolution request
     struct mg_dns *dns = c->mgr->use_dns6 ? &c->mgr->dns6 : &c->mgr->dns4;
@@ -2576,6 +2592,10 @@ static void mdns_cb(struct mg_connection *c, int ev, void *ev_data) {
       if (now > d->expire) mg_error(d->c, "mDNS timeout");  // will remove entry
     }
   } else if (ev == MG_EV_CLOSE) {
+    // Cached addresses are plain values (no pointers into this connection),
+    // and stay valid network facts regardless of whether the listener that
+    // happened to receive them is still open, so they're left in place --
+    // they'll simply age out via MG_MDNS_CACHE_TTL_MS.
     for (d = *head; d != NULL; d = tmp) {
       tmp = d->next;
       mg_error(d->c, "mDNS listener error");  // this will remove entry
@@ -2583,6 +2603,25 @@ static void mdns_cb(struct mg_connection *c, int ev, void *ev_data) {
   } else if (ev == MG_EV_MDNS_RESP) {
     struct mg_mdns_resp *resp = (struct mg_mdns_resp *) ev_data;
     if (resp->rr->atype == MG_DNS_RTYPE_A) {
+      size_t ci, slot = 0;
+      if (resp->name.len > 0 &&
+          resp->name.len < sizeof(c->mgr->mdns_cache[0].name)) {
+        for (ci = 0; ci < MG_MDNS_CACHE_SIZE; ci++) {
+          if (mg_strcasecmp(resp->name, mg_str(c->mgr->mdns_cache[ci].name)) ==
+              0) {
+            slot = ci;
+            break;
+          }
+          if (c->mgr->mdns_cache[ci].expires <
+              c->mgr->mdns_cache[slot].expires)
+            slot = ci;
+        }
+        memcpy(c->mgr->mdns_cache[slot].name, resp->name.buf, resp->name.len);
+        c->mgr->mdns_cache[slot].name[resp->name.len] = '\0';
+        c->mgr->mdns_cache[slot].addr = resp->addr;
+        c->mgr->mdns_cache[slot].expires =
+            mg_millis() + MG_MDNS_CACHE_TTL_MS;
+      }
       for (d = *head; d != NULL; d = tmp) {
         tmp = d->next;
         if (mg_strcasecmp(d->name, resp->name) != 0) continue;
@@ -2642,15 +2681,32 @@ static void sendmdnsreq(struct mg_connection *c, struct mg_str *name, int ms,
     mg_error(c, "resolve OOM");
   } else {
     struct mdns_data *reqs = (struct mdns_data *) c->mgr->active_mdns_requests;
+    struct mdns_data *other;
+    bool pending = false;
+    // A query already in flight for this name resolves every connection
+    // waiting on it (see the MG_EV_MDNS_RESP handler in mdns_cb()), so
+    // there's no need to send another; just add this connection to the
+    // list of connections that a matching response will resolve.
+    for (other = reqs; other != NULL; other = other->next) {
+      if (mg_strcasecmp(other->name, *name) == 0) {
+        pending = true;
+        break;
+      }
+    }
+    d->name = mg_strdup(*name);
+    if (d->name.buf == NULL) {
+      mg_free(d);
+      mg_error(c, "resolve OOM");
+      return;
+    }
     d->next = reqs;
     c->mgr->active_mdns_requests = d;
     d->expire = mg_millis() + (uint64_t) ms;
-    d->name = mg_strdup(*name);
     d->c = c;
     c->is_resolving = 1;
     MG_VERBOSE(
         ("%lu resolving %.*s via mDNS", c->id, (int) name->len, name->buf));
-    if (!mdns_query(mdnsc, name, MG_DNS_RTYPE_A)) {
+    if (!pending && !mdns_query(mdnsc, name, MG_DNS_RTYPE_A)) {
       mg_error(c, "mDNS send");  // will remove newly created entry
     }
   }
