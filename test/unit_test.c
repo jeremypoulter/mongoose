@@ -3962,6 +3962,21 @@ static void mdns_listing_responder_fn(struct mg_connection *c, int ev,
   (void) c;
 }
 
+static int s_mdns_cache_req_count;
+
+static void mdns_cache_responder_fn(struct mg_connection *c, int ev,
+                                    void *ev_data) {
+  if (ev == MG_EV_MDNS_REQ) {
+    struct mg_mdns_req *req = (struct mg_mdns_req *) ev_data;
+    if (req->rr->atype == MG_DNS_RTYPE_A) {
+      s_mdns_cache_req_count++;
+      req->is_resp = true;
+      req->respname = req->reqname;
+    }
+  }
+  (void) c;
+}
+
 static void raw_fn(struct mg_connection *c, int ev, void *ev_data) {
   (void) c, (void) ev, (void) ev_data;
 }
@@ -4247,6 +4262,39 @@ static void test_mdns_any_query_answers_hostname(void) {
   }
   for (i = 0; i < 200 && s_mdns_any_resp_seen == 0; i++) mg_mgr_poll(&mgr, 5);
   ASSERT(s_mdns_any_resp_seen > 0);
+  mg_mgr_free(&mgr);
+}
+
+static void mdns_cache_client_fn(struct mg_connection *c, int ev,
+                                 void *ev_data) {
+  if (ev == MG_EV_CONNECT) ((int *) c->fn_data)[0]++;
+  (void) ev_data;
+}
+
+// The recently-resolved cache added in mg_resolve() must serve a repeat
+// .local lookup without a fresh mDNS round trip.
+static void test_mdns_resolve_uses_cache(void) {
+  struct mg_mgr mgr;
+  struct mg_connection *responder;
+  int connected1 = 0, connected2 = 0;
+  int i;
+
+  mg_mgr_init(&mgr);
+  responder = mg_mdns_listen(&mgr, mdns_cache_responder_fn, NULL);
+  ASSERT(responder != NULL);
+
+  mg_connect(&mgr, "udp://cache-me.local:1", mdns_cache_client_fn,
+            &connected1);
+  for (i = 0; i < 200 && connected1 == 0; i++) mg_mgr_poll(&mgr, 5);
+  ASSERT(connected1 == 1);
+
+  // Take the responder away: a second resolve for the same name can now
+  // only succeed via the cache, not a new round trip.
+  mg_close_conn(responder);
+  mg_connect(&mgr, "udp://cache-me.local:2", mdns_cache_client_fn,
+            &connected2);
+  for (i = 0; i < 50 && connected2 == 0; i++) mg_mgr_poll(&mgr, 5);
+  ASSERT(connected2 == 1);
 
   mg_mgr_free(&mgr);
 }
@@ -4308,6 +4356,29 @@ static void test_mdns_resp_reentrant_close_safe(void) {
   ASSERT(s_mdns_reentrant_other == NULL);  // a's handler ran and closed b
 
   mg_mgr_free(&mgr);  // ASan/UBSan would flag any use-after-free above
+}
+
+// Two connections resolving the same .local name concurrently must
+// coalesce into a single mDNS query.
+static void test_mdns_resolve_coalesces_pending(void) {
+  struct mg_mgr mgr;
+  int connected1 = 0, connected2 = 0;
+  int i;
+
+  s_mdns_cache_req_count = 0;
+  mg_mgr_init(&mgr);
+  ASSERT(mg_mdns_listen(&mgr, mdns_cache_responder_fn, NULL) != NULL);
+
+  mg_connect(&mgr, "udp://shared-lookup.local:1", mdns_cache_client_fn,
+            &connected1);
+  mg_connect(&mgr, "udp://shared-lookup.local:2", mdns_cache_client_fn,
+            &connected2);
+  for (i = 0; i < 200 && (connected1 == 0 || connected2 == 0); i++)
+    mg_mgr_poll(&mgr, 5);
+  ASSERT(connected1 == 1 && connected2 == 1);
+  ASSERT(s_mdns_cache_req_count == 1);
+
+  mg_mgr_free(&mgr);
 }
 
 static void test_check_ip_acl(void) {
@@ -6462,6 +6533,9 @@ int main(void) {
   test_mdns_service_enumeration();
   test_mdns_any_query_answers_hostname();
   DASHBOARD("mdns_service_enumeration_any");
+  test_mdns_resolve_uses_cache();
+  test_mdns_resolve_coalesces_pending();
+  DASHBOARD("mdns_resolve_cache");
 
   s_error = false;
   test_wakeup();
