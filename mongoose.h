@@ -4305,10 +4305,15 @@ struct mg_dnssd_record {
 struct mg_mdns_req {
   struct mg_dns_rr *rr;         // Parsed resource record from the incoming query
   struct mg_dnssd_record *r;    // User-supplied service record to include in the response
+  struct mg_dnssd_record *listing;  // Service types to list, for is_listing; only
+                                     // srvcproto of each is used
+  size_t listing_count;             // Number of entries in listing
   struct mg_str reqname;        // Queried hostname, without the .local suffix
   struct mg_str respname;       // Hostname to use in response; defaults to fn_data if empty
   struct mg_addr *addr;         // IP address for A record; uses local interface if NULL
-  bool is_listing;  // True if this is a service-discovery listing (_services._dns-sd._udp)
+  bool is_listing;  // True if this is a service-discovery listing
+                     // (_services._dns-sd._udp); fill listing/listing_count
+                     // and set is_resp to answer it
   bool is_resp;     // Set to true in the handler to trigger a response
   bool is_unicast;  // True if the client requested a unicast (QU) response
 };
