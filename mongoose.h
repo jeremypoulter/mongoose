@@ -1395,6 +1395,20 @@ struct timeval {
 #define MG_MAX_HTTP_HEADERS 30
 #endif
 
+#ifndef MG_MDNS_CACHE_SIZE
+#define MG_MDNS_CACHE_SIZE 8  // struct mg_mgr :: mdns_cache entry count
+#endif
+
+#ifndef MG_MDNS_CACHE_TTL_MS
+// mg_mdns_resp carries no per-record TTL, so mgr->mdns_cache cannot honour a
+// record's real TTL (or evict early on a goodbye); every hit is held for
+// this fixed lifetime instead. It only needs to outlast RFC-6762 6's rule
+// that a responder must not repeat a multicast answer within 1s, which is
+// what breaks a client resolving the same .local name more than once in
+// quick succession (e.g. polling several services on one peer).
+#define MG_MDNS_CACHE_TTL_MS 5000
+#endif
+
 #ifndef MG_HTTP_INDEX
 #define MG_HTTP_INDEX "index.html"
 #endif
@@ -2438,6 +2452,11 @@ struct mg_mgr {
   uint16_t mqtt_id;             // Packet ID counter for MQTT pub/sub
   void *active_dns_requests;    // Pending DNS queries (internal)
   void *active_mdns_requests;   // Pending mDNS resolver queries (internal)
+  struct {
+    char name[64];
+    struct mg_addr addr;
+    uint64_t expires;
+  } mdns_cache[MG_MDNS_CACHE_SIZE];  // Recently resolved .local addresses
   struct mg_timer *timers;      // Linked list of active timers
   int epoll_fd;                 // epoll file descriptor; -1 when unused (MG_EPOLL_ENABLE=1)
   struct mg_tcpip_if *ifp;      // Builtin TCP/IP stack: network interface pointer
