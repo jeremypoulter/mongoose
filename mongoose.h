@@ -996,6 +996,10 @@ typedef enum { false = 0, true = 1 } bool;
     };
     #define IP_ADD_MEMBERSHIP  12
   #endif
+
+  #ifndef IP_MULTICAST_TTL
+    #define IP_MULTICAST_TTL  10
+  #endif
 #endif
 
 // Protect from calls like std::snprintf in app code

@@ -222,10 +222,12 @@ void mg_multicast_add(struct mg_connection *c, char *ip) {
   MG_ERROR(("struct ip_mreq not defined"));
 #else
   struct ip_mreq mreq;
+  int ttl = 255;  // RFC 6762 11: mDNS packets must be sent with TTL 255
   mreq.imr_multiaddr.s_addr = inet_addr(ip);
   mreq.imr_interface.s_addr = mg_htonl(INADDR_ANY);
   setsockopt(FD(c), IPPROTO_IP, IP_ADD_MEMBERSHIP, (char *) &mreq,
              sizeof(mreq));
+  setsockopt(FD(c), IPPROTO_IP, IP_MULTICAST_TTL, (char *) &ttl, sizeof(ttl));
 #endif  // !Zephyr
 #endif  // !lwIP
 #endif
@@ -265,6 +267,18 @@ bool mg_open_listener(struct mg_connection *c, const char *url) {
       // SO_REUSE = 1 in lwipopts.h, otherwise the code below will compile but
       // won't work! (setsockopt will return EINVAL)
       MG_ERROR(("setsockopt(SO_REUSEADDR): %d", MG_SOCK_ERR(rc)));
+#endif
+#if defined(SO_REUSEPORT)
+      // UDP only: lets several sockets share the exact same address:port,
+      // e.g. our mDNS listener and the platform's own mDNS responder (such
+      // as macOS's mDNSResponder/Bonjour, which otherwise refuses our bind
+      // to the wildcard address on port 5353 outright). Not applied to TCP,
+      // where silently sharing a listening port across processes would be
+      // a surprising, security-relevant behaviour change.
+    } else if (type == SOCK_DGRAM &&
+               (rc = setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (char *) &on,
+                                sizeof(on))) != 0) {
+      MG_ERROR(("setsockopt(SO_REUSEPORT): %d", MG_SOCK_ERR(rc)));
 #endif
 #if MG_IPV6_V6ONLY
       // Bind only to the V6 address, not V4 address on this port
