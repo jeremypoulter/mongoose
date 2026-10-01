@@ -2844,6 +2844,45 @@ static void test_dns(void) {
     ASSERT(mg_dns_parse(d, sizeof(d), &dm) == 0);
   }
 
+  {
+    // A compression pointer that jumps forward can never terminate
+    // backwards; it must be rejected outright rather than silently
+    // accepted as an empty/truncated name. (A self-reference, unlike a
+    // forward jump, stays accepted -- see the "Point a pointer to itself"
+    // case near the top of this test.)
+    struct mg_dns_rr rr;
+    uint8_t d[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 12-byte header
+                   0xc0, 14, 0, 1, 0, 1};  // forward pointer, type, class
+    ASSERT(mg_dns_parse_rr(d, sizeof(d), 12, true, &rr) == 0);
+  }
+
+  {
+    // A backward compression pointer whose target is itself another,
+    // earlier pointer (a pointer-to-pointer chain) must be followed to
+    // completion, not stopped short of the real name. The second
+    // answer's name here is such a chain: it points at the first
+    // answer's own compression pointer, which in turn points at the
+    // question's literal name.
+    uint8_t d[] = {
+        0,    0,    0x80, 0,    0,    1,    0,    2,    0,  0,  0,  0,  // header: 1 question, 2 answers, response
+        3,    'a',  'b',  'c',  0,                                     // @12: "abc"
+        0,    1,    0,    1,                                           // @17: question type, class
+        0xc0, 12,                                                      // @21: answer 1 name -> 12 ("abc")
+        0,    16,   0,    1,                                           // @23: answer 1 type TXT, class IN
+        0,    0,    0,    0,                                           // @27: answer 1 TTL
+        0,    0,                                                       // @31: answer 1 rdlength (empty)
+        0xc0, 21,                                                      // @33: answer 2 name -> 21 (a pointer)
+        0,    1,    0,    1,                                           // @35: answer 2 type A, class IN
+        0,    0,    0,    0,                                           // @39: answer 2 TTL
+        0,    4,                                                       // @43: answer 2 rdlength
+        192,  0,    2,    1,                                           // @45: answer 2 rdata (192.0.2.1)
+    };
+    memset(&dm, 0, sizeof(dm));
+    ASSERT(mg_dns_parse(d, sizeof(d), &dm) == 1);
+    ASSERT(dm.resolved == true);
+    ASSERT(strcmp(dm.name, "abc") == 0);
+  }
+
   test_dns_error("udp://127.0.0.1:12345", "DNS timeout");
   test_dns_error("", "resolver");
   test_dns_error("tcp://0.0.0.0:0", "DNS error");

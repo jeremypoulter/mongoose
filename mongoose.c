@@ -1712,14 +1712,19 @@ static size_t mg_dns_parse_name_depth(const uint8_t *s, size_t len, size_t ofs,
       if (i + 1 >= len - ofs) return 0;  // 2nd pointer byte missing
       ptr = (((n & 0x3f) << 8) | s[ofs + i + 1]);  // 12 is hdr len
       // MG_INFO(("PTR %lx", (unsigned long) ptr));
-      // Only follow a pointer that goes strictly backwards to a byte that
-      // isn't itself a pointer; that makes a pointer cycle structurally
-      // impossible (the depth limit above is then only a backstop) since
-      // ptr < ofs + i shrinks on every hop. A self-reference, a forward
-      // jump, or a pointer-to-pointer is left unfollowed: the name so far
-      // (possibly empty) is treated as complete, matching this parser's
-      // long-standing behaviour for that class of malformed input.
-      if (ptr < ofs + i && (s[ptr] & 0xc0) == 0 &&
+      // A forward jump can never terminate backwards, so it isn't a valid
+      // name: reject it rather than silently returning whatever was
+      // decoded so far. A pointer that goes strictly backwards is always
+      // followed, including to a target that is itself another, earlier
+      // pointer -- DNS compression routinely chains them (e.g. instance
+      // -> service -> local) -- which also makes a pointer cycle
+      // structurally impossible (the depth limit above is then only a
+      // backstop) since ptr < ofs + i shrinks on every hop. A
+      // self-reference is left unfollowed: the name so far (possibly
+      // empty) is treated as complete, matching this parser's
+      // long-standing behaviour for that one case.
+      if (ptr > ofs + i) return 0;
+      if (ptr < ofs + i &&
           mg_dns_parse_name_depth(s, len, ptr, to, tolen, j, depth + 1) == 0)
         return 0;
       return i + 2;
