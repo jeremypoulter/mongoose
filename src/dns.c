@@ -440,8 +440,10 @@ static void handle_mdns_query(struct mg_connection *c) {
   n = mg_dns_parse_rr(c->recv.buf, c->recv.len, 12, true, &rr);
   MG_VERBOSE(("mDNS request parsed, result=%d", (int) n));
   if (n > 0) {
-    // RFC-6762 Appendix C, RFC2181 11: m(n + 1-63), max 255 + 0x0
-    uint8_t buf[sizeof(struct mg_dns_header) + 256 + sizeof(mdns_answer) + 4];
+    // RFC-6762 Appendix C, RFC2181 11: m(n + 1-63), max 255 + 0x0 for a
+    // single-name reply; a service-type listing (below) can have several
+    // PTR answers, so this is sized more generously than one name needs.
+    uint8_t buf[1024];
     struct mg_dns_header *h = (struct mg_dns_header *) buf;
     uint8_t *p = &buf[sizeof(*h)];
     char name[256];
@@ -460,6 +462,12 @@ static void handle_mdns_query(struct mg_connection *c) {
         (rr.aclass != 1 && rr.aclass != 0xff))
       return;
     name[name_len -= 6] = '\0';  // remove .local
+    if (rr.atype == 255) {  // ANY: our hostname is an A query, anything
+                             // else is treated as a service-instance query
+      rr.atype = (c->fn_data != NULL && mg_casecmp((char *) c->fn_data, name) == 0)
+                     ? MG_DNS_RTYPE_A
+                     : MG_DNS_RTYPE_SRV;
+    }
     MG_VERBOSE(("RR %u %u %s", (unsigned int) rr.atype,
                 (unsigned int) rr.aclass, name));
     if (rr.atype == MG_DNS_RTYPE_A) {
@@ -505,11 +513,35 @@ static void handle_mdns_query(struct mg_connection *c) {
     h->num_answers = mg_htons(1);  // RFC-6762 6: 0 questions, 1 Answer
     h->flags = mg_htons(0x8400);   // Authoritative response
     if (req.is_listing) {
+      // RFC-6763 9: service type enumeration. One PTR answer per listed
+      // service type, owner name "_services._dns-sd._udp.local" (fixed),
+      // target "<srvcproto>.local" -- e.g. "_http._tcp.local".
       // TODO(): RFC-6762 6: each responder SHOULD delay its response by a
       // random amount of time selected with uniform random distribution in the
       // range 20-120 ms.
-      // TODO():
-      return;
+      static const uint8_t owner[] = {9,  '_', 's', 'e', 'r', 'v', 'i', 'c',
+                                      'e', 's', 7,  '_', 'd', 'n', 's', '-',
+                                      's', 'd', 4,  '_', 'u', 'd', 'p', 5,
+                                      'l', 'o', 'c', 'a', 'l', 0};
+      size_t i, count = 0;
+      for (i = 0; i < req.listing_count; i++) {
+        struct mg_dnssd_record *r = &req.listing[i];
+        uint8_t *rdlen_pos;
+        uint16_t rdlen;
+        size_t need = sizeof(owner) + sizeof(mdns_answer) + r->srvcproto.len + 8;
+        if ((size_t) (p - buf) + need > sizeof(buf)) break;
+        memcpy(p, owner, sizeof(owner)), p += sizeof(owner);
+        memcpy(p, mdns_answer, sizeof(mdns_answer));
+        p[1] = MG_DNS_RTYPE_PTR;  // overwrite record type
+        p += sizeof(mdns_answer);
+        rdlen_pos = p - 2;
+        p = build_srv_name(p, r);  // target: <srvcproto>.local
+        rdlen = mg_htons((uint16_t) (p - rdlen_pos - 2));
+        memcpy(rdlen_pos, &rdlen, 2);
+        count++;
+      }
+      if (count == 0) return;
+      h->num_answers = mg_htons((uint16_t) count);
     } else if (rr.atype == MG_DNS_RTYPE_PTR) {  // serve PTR + SRV + TXT + A
       // TODO(): RFC-6762 6: each responder SHOULD delay its response by a
       // random amount of time selected with uniform random distribution in the
