@@ -114,6 +114,20 @@
 #define MG_MAX_HTTP_HEADERS 30
 #endif
 
+#ifndef MG_MDNS_CACHE_SIZE
+#define MG_MDNS_CACHE_SIZE 8  // struct mg_mgr :: mdns_cache entry count
+#endif
+
+#ifndef MG_MDNS_CACHE_TTL_MS
+// mg_mdns_resp carries no per-record TTL, so mgr->mdns_cache cannot honour a
+// record's real TTL (or evict early on a goodbye); every hit is held for
+// this fixed lifetime instead. It only needs to outlast RFC-6762 6's rule
+// that a responder must not repeat a multicast answer within 1s, which is
+// what breaks a client resolving the same .local name more than once in
+// quick succession (e.g. polling several services on one peer).
+#define MG_MDNS_CACHE_TTL_MS 5000
+#endif
+
 #ifndef MG_HTTP_INDEX
 #define MG_HTTP_INDEX "index.html"
 #endif
