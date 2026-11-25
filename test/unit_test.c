@@ -3922,6 +3922,12 @@ static void mdns_multiq_responder_fn(struct mg_connection *c, int ev,
       req->is_resp = true;
       req->respname = req->reqname;  // echo back whatever was asked
     }
+  } else if (ev == MG_EV_MDNS_RESP) {
+    struct mg_mdns_resp *resp = (struct mg_mdns_resp *) ev_data;
+    if (resp->rr->atype == MG_DNS_RTYPE_A) {
+      if (mg_strcmp(resp->name, mg_str("q1.local")) == 0) s_mdns_q1_seen++;
+      if (mg_strcmp(resp->name, mg_str("q2.local")) == 0) s_mdns_q2_seen++;
+    }
   }
   (void) c;
 }
@@ -4002,18 +4008,6 @@ static void test_mdns_response_skips_question(void) {
   for (i = 0; i < 200 && s_mdns_resp_seen == 0; i++) mg_mgr_poll(&mgr, 5);
   ASSERT(s_mdns_resp_seen > 0);
   mg_mgr_free(&mgr);
-}
-
-static void mdns_multiq_watcher_fn(struct mg_connection *c, int ev,
-                                   void *ev_data) {
-  if (ev == MG_EV_MDNS_RESP) {
-    struct mg_mdns_resp *resp = (struct mg_mdns_resp *) ev_data;
-    if (resp->rr->atype == MG_DNS_RTYPE_A) {
-      if (mg_strcmp(resp->name, mg_str("q1.local")) == 0) s_mdns_q1_seen++;
-      if (mg_strcmp(resp->name, mg_str("q2.local")) == 0) s_mdns_q2_seen++;
-    }
-  }
-  (void) c;
 }
 
 static int s_mdns_listing_ptr_count;
@@ -4164,16 +4158,6 @@ static void test_mdns_answers_every_question(void) {
   mg_mgr_init(&mgr);
   responder = mg_mdns_listen(&mgr, mdns_multiq_responder_fn, NULL);
   ASSERT(responder != NULL);
-  if (mg_mdns_listen(&mgr, mdns_multiq_watcher_fn, NULL) == NULL) {
-    // A second mg_mdns_listen() in the same process binds the same
-    // multicast group:port as the first; without SO_REUSEPORT
-    // (POSIX-only, not available on Windows) some platforms (seen on
-    // Windows CI) refuse to share it. Skip rather than fail on a platform
-    // quirk unrelated to the multi-question fix under test.
-    MG_INFO(("second mDNS listener unsupported on this platform, skipping"));
-    mg_mgr_free(&mgr);
-    return;
-  }
   if (!mg_mdns_query(responder, "probe.local", MG_DNS_RTYPE_A)) {
     // Some BSD-derived socket stacks (seen on macOS CI) refuse to send from
     // mg_mdns_listen()'s multicast-address-bound socket -- a pre-existing
